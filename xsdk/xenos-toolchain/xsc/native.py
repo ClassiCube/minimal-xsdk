@@ -1,0 +1,302 @@
+"""xost's compiler in C (xsdk:src/xsc_compile.c), called through ctypes.
+
+make builds the library, build/host/libxsc.so, in WSL; the tools that compile shaders run there.
+"""
+from __future__ import annotations
+
+import ctypes
+import struct
+from pathlib import Path
+
+LIBRARY = Path(__file__).resolve().parents[2] / "build" / "host" / "libxsc.so"
+
+OK, REFUSED, REGISTERS, BAD_VALUE, MALFORMED, OUT_OF_MEMORY = range(6)
+STATUS_NAMES = ("ok", "refused", "registers", "bad value", "malformed", "out of memory")
+LITERAL, ARRAY, LOOP, BLOCK_LOOP, CLIP_PLANE, FIXED_LOOP = range(6)
+RESOURCE_KINDS = ("push", "uniform", "sampler", "comparison", "instance", "vertex_base")
+MESSAGE_BYTES = 512
+# The pixel constant gl_FragCoord.xy adds to the pixel parameters, which xsdk keeps at 0.5 and 0.5 more than a tiled
+# pass's band's top row (xsdk:include/xsdk/xsc.h, XSDK_XSC_FRAG_COORD_CONSTANT).
+FRAG_COORD_CONSTANT = 255
+# xsdk_xsc_link's (xsdk:include/xsdk/xsc.h), and SQ_PROGRAM_CNTL's vs_export_count, the interpolators less 1
+# (xenia:src/xenia/gpu/registers.h:142-143).
+INTERPOLATORS, UNLINKED, BY_LOCATION, UNLINKABLE = 16, 0xFF, -1, -2
+EXPORT_COUNT_SHIFT, EXPORT_COUNT_MASK = 20, 0xF << 20
+
+
+class Options(ctypes.Structure):
+    _fields_ = [("pixel_registers", ctypes.c_uint32), ("vertex_registers", ctypes.c_uint32),
+                ("optimize", ctypes.c_bool), ("group_fetches", ctypes.c_bool), ("instanced", ctypes.c_bool)]
+
+
+class Need(ctypes.Structure):
+    _fields_ = [("kind", ctypes.c_int), ("reg", ctypes.c_uint32), ("regs", ctypes.c_uint32),
+                ("value", ctypes.c_double * 4), ("name", ctypes.c_char_p), ("block", ctypes.c_int),
+                ("set", ctypes.c_uint32), ("binding", ctypes.c_uint32), ("offset_bytes", ctypes.c_uint32),
+                ("start", ctypes.c_int32), ("step", ctypes.c_int32)]
+
+
+class Resource(ctypes.Structure):
+    _fields_ = [("kind", ctypes.c_int), ("set", ctypes.c_uint32), ("binding", ctypes.c_uint32),
+                ("reg", ctypes.c_uint32), ("regs", ctypes.c_uint32)]
+
+
+class Shader(ctypes.Structure):
+    _fields_ = [("container", ctypes.POINTER(ctypes.c_uint8)), ("container_bytes", ctypes.c_size_t),
+                ("needs", ctypes.POINTER(Need)), ("need_count", ctypes.c_size_t),
+                ("resources", ctypes.POINTER(Resource)), ("resource_count", ctypes.c_size_t),
+                ("message", ctypes.c_char * MESSAGE_BYTES)]
+
+
+class _Xsc(ctypes.Structure):
+    _fields_ = [("chunks", ctypes.c_void_p), ("status", ctypes.c_int), ("message", ctypes.c_char * MESSAGE_BYTES)]
+
+
+class _Var(ctypes.Structure):
+    _fields_ = [("vid", ctypes.c_uint32), ("name", ctypes.c_char_p), ("storage_class", ctypes.c_uint32),
+                ("pointee", ctypes.c_int64), ("location", ctypes.c_int64), ("binding", ctypes.c_int64),
+                ("builtin", ctypes.c_int64), ("descriptor_set", ctypes.c_int64)]
+
+
+class _VarUse(ctypes.Structure):
+    _fields_ = [("var", ctypes.POINTER(_Var)), ("a", ctypes.c_uint32), ("b", ctypes.c_uint32)]
+
+
+class _ConstantSlot(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p), ("reg", ctypes.c_uint32), ("regs", ctypes.c_uint32),
+                ("member", ctypes.c_int32), ("block", ctypes.c_int32), ("moved", ctypes.c_bool)]
+
+
+class _Block(ctypes.Structure):
+    _fields_ = [("push", ctypes.c_bool), ("var", ctypes.POINTER(_Var)), ("struct_type", ctypes.c_uint32),
+                ("reg", ctypes.c_uint32), ("regs", ctypes.c_uint32)]
+
+
+# The interface xsdk:src/xsc_private.h's XscInterface holds; the compiler's own lookup, its roles, stays in C.
+class _Interface(ctypes.Structure):
+    _fields_ = [("pixel", ctypes.c_bool),
+                ("vfetch", ctypes.POINTER(_VarUse)), ("vfetch_count", ctypes.c_size_t),
+                ("interp_out", ctypes.POINTER(_VarUse)), ("interp_out_count", ctypes.c_size_t),
+                ("interp_in", ctypes.POINTER(_VarUse)), ("interp_in_count", ctypes.c_size_t),
+                ("color_out", ctypes.POINTER(_VarUse)), ("color_out_count", ctypes.c_size_t),
+                ("samplers", ctypes.POINTER(_VarUse)), ("sampler_count", ctypes.c_size_t),
+                ("position_out", ctypes.c_uint32), ("frag_coord", ctypes.POINTER(_Var)),
+                ("frag_depth", ctypes.POINTER(_Var)), ("front_facing", ctypes.POINTER(_Var)),
+                ("constants", ctypes.POINTER(_ConstantSlot)), ("constant_count", ctypes.c_size_t),
+                ("blocks", ctypes.POINTER(_Block)), ("block_count", ctypes.c_size_t),
+                ("constant_end", ctypes.c_uint32),
+                ("sampler_dims", ctypes.POINTER(ctypes.c_int64)), ("sampler_dim_count", ctypes.c_size_t),
+                ("roles", ctypes.c_void_p), ("role_limit", ctypes.c_uint32),
+                ("comparisons", ctypes.POINTER(_VarUse)), ("comparison_count", ctypes.c_size_t),
+                ("point_coord", ctypes.POINTER(_Var)), ("vpos", ctypes.POINTER(_Var)), ("vface", ctypes.POINTER(_Var)),
+                ("point_size", ctypes.POINTER(_Var))]
+
+
+# Room for xsc_private.h's XscModule, which only the C reads.
+MODULE_BYTES = 1024
+
+
+class CompileError(Exception):
+    """The compiler's status and message for a shader it didn't compile."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+_library = None
+
+
+def _load():
+    global _library
+    if _library is None:
+        _library = ctypes.CDLL(str(LIBRARY))
+        _library.xsdk_xsc_compile.argtypes = [ctypes.POINTER(ctypes.c_uint32), ctypes.c_size_t,
+                                              ctypes.POINTER(Options), ctypes.POINTER(Shader)]
+        _library.xsdk_xsc_compile.restype = ctypes.c_int
+        _library.xsdk_xsc_free.argtypes = [ctypes.POINTER(Shader)]
+        _library.xsdk_xsc_free.restype = None
+        _library.xsdk_xsc_loop_passes.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+        _library.xsdk_xsc_loop_passes.restype = ctypes.c_uint32
+        _library.xsdk_xsc_spirv_parse.argtypes = [ctypes.POINTER(_Xsc), ctypes.POINTER(ctypes.c_uint32),
+                                                  ctypes.c_size_t, ctypes.c_void_p]
+        _library.xsdk_xsc_spirv_parse.restype = ctypes.c_bool
+        _library.xsdk_xsc_resolve_interface.argtypes = [ctypes.POINTER(_Xsc), ctypes.c_void_p,
+                                                        ctypes.POINTER(_Interface)]
+        _library.xsdk_xsc_resolve_interface.restype = ctypes.c_bool
+        _library.xsdk_xsc_release.argtypes = [ctypes.POINTER(_Xsc)]
+        _library.xsdk_xsc_release.restype = None
+        _library.xsdk_xsc_link.argtypes = [ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+                                           ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+                                           ctypes.POINTER(ctypes.c_uint8)]
+        _library.xsdk_xsc_link.restype = ctypes.c_int32
+        _library.xsdk_xsc_link_export.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint8)]
+        _library.xsdk_xsc_link_export.restype = ctypes.c_uint32
+    return _library
+
+
+def _optional(value: int):
+    return None if value == -1 else value
+
+
+def _text(raw: bytes | None) -> str:
+    return raw.decode("utf-8", "replace") if raw is not None else ""
+
+
+def resolve_spirv(spirv: bytes):
+    """The interface as xsdk:src/xsc_resolve.c lays it out, in plain values: a dict of lists of tuples and dicts, which
+    xsc/resolve.py turns into its dataclasses. Raises CompileError for a module it can't lay out."""
+    library = _load()
+    words = (ctypes.c_uint32 * (len(spirv) // 4)).from_buffer_copy(spirv[:len(spirv) // 4 * 4])
+    x = _Xsc()
+    module = ctypes.create_string_buffer(MODULE_BYTES)
+    si = _Interface()
+    try:
+        if not (library.xsdk_xsc_spirv_parse(ctypes.byref(x), words, len(words), module)
+                and library.xsdk_xsc_resolve_interface(ctypes.byref(x), module, ctypes.byref(si))):
+            raise CompileError(x.status, x.message.decode(errors="replace"))
+        cache = {}
+
+        def var(pointer):
+            if not pointer:
+                return None
+            v = pointer.contents
+            if v.vid not in cache:
+                cache[v.vid] = dict(vid=v.vid, name=_text(v.name), storage_class=v.storage_class,
+                                    pointee=_optional(v.pointee), location=_optional(v.location),
+                                    binding=_optional(v.binding), builtin=_optional(v.builtin),
+                                    descriptor_set=_optional(v.descriptor_set))
+            return cache[v.vid]
+
+        def uses(items, count, pair):
+            return [(var(items[i].var), items[i].a) + (() if pair else (items[i].b,)) for i in range(count)]
+
+        return dict(
+            stage="pixel" if si.pixel else "vertex",
+            vfetch=uses(si.vfetch, si.vfetch_count, False),
+            interp_out=uses(si.interp_out, si.interp_out_count, False),
+            interp_in=uses(si.interp_in, si.interp_in_count, False),
+            color_out=uses(si.color_out, si.color_out_count, True),
+            samplers=uses(si.samplers, si.sampler_count, True),
+            position_out=si.position_out or None,
+            frag_coord=var(si.frag_coord),
+            front_facing=var(si.front_facing),
+            point_coord=var(si.point_coord),
+            vpos=var(si.vpos),
+            vface=var(si.vface),
+            point_size=var(si.point_size),
+            constants=[(_text(c.name), c.reg, c.regs, c.member)
+                       for c in (si.constants[i] for i in range(si.constant_count))],
+            blocks=[("push" if b.push else "uniform", var(b.var), b.struct_type, b.reg, b.regs)
+                    for b in (si.blocks[i] for i in range(si.block_count))],
+            constant_end=si.constant_end,
+            sampler_dims={si.sampler_dims[2 * i]: _optional(si.sampler_dims[2 * i + 1])
+                          for i in range(si.sampler_dim_count)},
+            comparisons=uses(si.comparisons, si.comparison_count, False))
+    finally:
+        library.xsdk_xsc_release(ctypes.byref(x))
+
+
+def _need(n: Need):
+    if n.kind == LITERAL:
+        return n.reg, tuple(n.value)
+    if n.kind == ARRAY:
+        return "array", n.reg, n.regs, n.name.decode()
+    if n.kind == BLOCK_LOOP:
+        return "block_loop", n.reg, RESOURCE_KINDS[n.block], n.set, n.binding, n.offset_bytes, n.start, n.step
+    if n.kind == CLIP_PLANE:
+        return "clip", n.regs, n.reg
+    if n.kind == FIXED_LOOP:
+        return "fixed_loop", n.reg, n.regs
+    return "loop", n.reg, n.name.decode()
+
+
+def loop_passes(start: int, step: int, n: int) -> int:
+    """The passes a block loop's loop constant runs where its block holds n (xsdk:include/xsdk/xsc.h,
+    xsdk_xsc_loop_passes)."""
+    return _load().xsdk_xsc_loop_passes(start, step, n)
+
+
+def compile_spirv(spirv: bytes, pixel_registers: int, vertex_registers: int, optimize: bool = False,
+                  group_fetches: bool = True, instanced: bool = False):
+    """(container, manifest, resources) as lower.py's lower_ex gives the first two and build_shaders.py the last:
+    the manifest [(register, (f0, f1, f2, f3))], with ("array", reg, regs, name) and ("loop", id, name) for a
+    hardware loop a bare uniform counts, ("block_loop", id, kind, set, binding, offset_bytes, start, step) for one an
+    int in a block counts, i from start by step, ("fixed_loop", id, passes) for loops whose count is data, which run
+    passes, 255, and ("clip", plane, register) for a user clip plane; the resources [(kind, set, binding, register,
+    registers)], blocks, samplers, comparisons, then an instanced vertex shader's group, the float constant the runtime
+    writes before each piece of a draw (xsdk:include/xsdk/xsc.h, XSDK_XSC_INSTANCE), then the vertex base of one
+    reading gl_VertexIndex, the float constant the runtime writes before each draw (XSDK_XSC_VERTEX_BASE). instanced
+    lowers a vertex shader for instanced draws, as one reading gl_InstanceIndex always is."""
+    library = _load()
+    words = (ctypes.c_uint32 * (len(spirv) // 4)).from_buffer_copy(spirv[:len(spirv) // 4 * 4])
+    options = Options(pixel_registers, vertex_registers, optimize, group_fetches, instanced)
+    shader = Shader()
+    status = library.xsdk_xsc_compile(words, len(words), ctypes.byref(options), ctypes.byref(shader))
+    if status != OK:
+        raise CompileError(status, shader.message.decode(errors="replace"))
+    try:
+        container = ctypes.string_at(shader.container, shader.container_bytes)
+        manifest = [_need(shader.needs[i]) for i in range(shader.need_count)]
+        resources = [(RESOURCE_KINDS[r.kind], r.set, r.binding, r.reg, r.regs)
+                     for r in (shader.resources[i] for i in range(shader.resource_count))]
+    finally:
+        library.xsdk_xsc_free(ctypes.byref(shader))
+    return container, manifest, resources
+
+
+def records(blob: bytes):
+    """A container's interpolator records and a vertex shader's export slots, read where xsdk:src/shader.c's
+    xsdk_shader_load finds them: the records after a pixel shader's outputs or a vertex shader's patch table, as many
+    as the record's interpolator info counts, then the slots up to the microcode."""
+    words = struct.unpack(f">{len(blob) // 4}I", blob)
+    record = words[6] // 4
+    vertex = words[0] & 0xFF == 1
+    first = record + 8 + (words[record + 6] * 2 + words[record + 7] if vertex else 0)
+    count = words[record + 5] >> 5 & 0x1F
+    code = (words[1] + words[record]) // 4
+    return list(words[first:first + count]), list(words[first + count:code]) if vertex else []
+
+
+# The constant table's register sets (XenosRecomp:XenosRecomp/constant_table.h, RegisterSet).
+REGISTER_SETS = ("bool", "int4", "float4", "sampler")
+
+
+def constant_table(blob: bytes):
+    """A container's constant table, where xsdk:src/shader.c's xsdk_shader_constant reads it: each entry's name,
+    register set, register index and count, and its type's class, type, rows, columns and elements
+    (XenosRecomp:XenosRecomp/constant_table.h)."""
+    table = struct.unpack_from(">I", blob, 16)[0] + 4
+    count, first = struct.unpack_from(">II", blob, table + 12)
+    out = []
+    for i in range(count):
+        name, set_, index, regs, _, type_info, _ = struct.unpack_from(">IHHHHII", blob, table + first + 20 * i)
+        text = blob[table + name:blob.index(b"\0", table + name)].decode()
+        out.append((text, REGISTER_SETS[set_], index, regs) + struct.unpack_from(">5H", blob, table + type_info))
+    return out
+
+
+def link(vertex: bytes, pixel: bytes) -> bytes:
+    """The vertex shader's container as xsdk_shader_link leaves it linked to the pixel shader's on the console
+    (xsdk:src/shader.c), through the same xsdk_xsc_link and xsdk_xsc_link_export: each export to an interpolator
+    rewritten from the container's, and SQ_PROGRAM_CNTL's export count the pixel shader's interpolators. The container
+    as it is for a pair linked by location, as GLSL's are; CompileError, REFUSED, for one of each."""
+    library = _load()
+    vertex_records, slots = records(vertex)
+    pixel_records, _ = records(pixel)
+    links = (ctypes.c_uint8 * INTERPOLATORS)()
+    exported = library.xsdk_xsc_link((ctypes.c_uint32 * len(vertex_records))(*vertex_records), len(vertex_records),
+                                     (ctypes.c_uint32 * len(pixel_records))(*pixel_records), len(pixel_records), links)
+    if exported == BY_LOCATION:
+        return vertex
+    if exported == UNLINKABLE:
+        raise CompileError(REFUSED, "one shader's interpolators link by semantic and the other's by location")
+    out = bytearray(vertex)
+    record = struct.unpack_from(">I", vertex, 24)[0]
+    control = struct.unpack_from(">I", vertex, record + 8)[0]
+    struct.pack_into(">I", out, record + 8, control & ~EXPORT_COUNT_MASK | max(exported - 1, 0) << EXPORT_COUNT_SHIFT)
+    code = struct.unpack_from(">I", vertex, 4)[0] + struct.unpack_from(">I", vertex, record)[0]
+    for slot in slots:
+        at = code + (slot & 0xFFF) * 12
+        struct.pack_into(">I", out, at, library.xsdk_xsc_link_export(struct.unpack_from(">I", vertex, at)[0], links))
+    return bytes(out)
